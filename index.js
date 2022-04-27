@@ -8,7 +8,9 @@ const session = require("express-session");
 const MongoStore = require("connect-mongo");
 const { authCheck } = require("./middleware/auth");
 const authRoutes = require("./routes/authroutes");
-const paymentRoutes = require("./middleware/payment");
+const upload = require("./multer.js");
+const events = require("./models/Events.js");
+// const paymentRoutes = require("./middleware/payment");
 const connectDB = require("./config/db");
 const {
     findEvent,
@@ -21,12 +23,14 @@ const {
     removeMember,
     deleteOldInviteCode,
     createNewInviteCode,
-    allEventDetails
+    allEventDetails,
+    userDetails,
 } = require("./utils");
 var url = require("url");
 
 const { generateString } = require("./utils");
 const code = require("./models/code.js");
+const paymentDetail = require("./models/payment-detail");
 
 // Load config
 require("dotenv").config({ path: "./config/config.env" });
@@ -54,16 +58,19 @@ app.set("view engine", "ejs");
 app.use(express.static(__dirname + "/static"));
 app.use("/images", express.static(__dirname + "static/images"));
 
-app.use(function(req, res, next) {
+app.use(function (req, res, next) {
     if (!req.user) {
-        res.header('Cache-Control', 'private, no-cache, no-store, must-revalidate');
-        res.header('Expires', '-1');
-        res.header('Pragma', 'no-cache');
+        res.header(
+            "Cache-Control",
+            "private, no-cache, no-store, must-revalidate"
+        );
+        res.header("Expires", "-1");
+        res.header("Pragma", "no-cache");
     }
     next();
 });
 
-app.use('/xpecto.ico', express.static('../static/images/xpecto.ico'));
+app.use("/xpecto.ico", express.static("../static/images/xpecto.ico"));
 // Sessions middleware
 app.use(
     session({
@@ -79,7 +86,7 @@ app.use(passport.initialize());
 app.use(passport.session());
 // Routes
 app.use("/auth", authRoutes);
-app.use("/payment", authCheck, paymentRoutes);
+// app.use("/payment", authCheck, paymentRoutes);
 
 app.get("/about", (req, res) => {
     res.render("aboutus", {
@@ -116,13 +123,12 @@ app.get("/TandC", (req, res) => {
     });
 });
 
-
 app.get("/", (req, res) => {
     if (req.session.user == null) {
         user = {
             status: 0,
         };
-        req.session.user = user
+        req.session.user = user;
     }
 
     // console.log(req.session.user)
@@ -137,7 +143,7 @@ app.get("/profile", authCheck, async (req, res) => {
     res.render("profile", {
         user: req.user,
         authenticated: req.isAuthenticated(),
-        ...context
+        ...context,
     });
 });
 
@@ -197,11 +203,20 @@ app.get("/joinTeam", authCheck, async (req, res) => {
 app.get("/deleteTeam", authCheck, async (req, res) => {
     const current_url = url.parse(req.url, true);
     const params = current_url.query;
-
-    await deleteTeam(params.team);
+    const teamTable = require("./models/Team");
 
     const event = await findEventFromId(params.event);
-    res.redirect(`/event?event=${event.name}`);
+
+    var team = await teamTable
+        .findOne({ event: event._id, teamLeader: req.user._id })
+        .lean();
+
+    if (team != null) {
+        await deleteTeam(params.team);
+        res.redirect(`/event?event=${event.name}`);
+    } else {
+        console.log("Only Team Leader can delete a team!");
+    }
 });
 
 app.post("/joinTeam", authCheck, async (req, res) => {
@@ -221,11 +236,45 @@ app.get("/userTeam", authCheck, async (req, res) => {
     const team = await findUserTeam(req);
     const inviteCodeTable = require("./models/InviteCode");
     var inviteCode = await inviteCodeTable.findOne({ team: team._id }).lean();
+
+    // only team leader can delete a team and generate a invite code.
+    const teamTable = require("./models/Team");
+    var teaminfo = await teamTable
+        .findOne({ event: team.event, teamLeader: req.user._id })
+        .lean();
+    let leader = false;
+    if (teaminfo != null) {
+        leader = true;
+    }
+
+    // event details
+    const event = await findEvent(req);
+
+    // user info
+    let leaderinfo = null;
+    if (leader) {
+        leaderinfo = await userDetails(req.user._id);
+    } else {
+        const teamdata = await teamTable.findOne({ event: team.event }).lean();
+        leaderinfo = await userDetails(teamdata.teamLeader);
+    }
+
+    //team member details
+    let members_info = [];
+    for (let index = 0; index < team.members.length; index++) {
+        let mem_id = team.members[index].member_id;
+        let info = await userDetails(mem_id);
+        members_info.push(info);
+    }
     context = {
+        event: event,
         team: team,
         authenticated: req.isAuthenticated(),
         inviteCode: null,
         validUpto: null,
+        leader: leader,
+        leaderinfo: leaderinfo,
+        members_info: members_info,
     };
     // console.log(team);
     if (inviteCode != null && inviteCode.validUpto >= Date.now()) {
@@ -234,7 +283,6 @@ app.get("/userTeam", authCheck, async (req, res) => {
     }
 
     res.render("Team/userTeam", { ...context, user: req.session.user });
-
 });
 
 app.get("/generateInviteCode", authCheck, async (req, res) => {
@@ -252,6 +300,52 @@ app.get("/error", (req, res) =>
         user: req.session.user,
     })
 );
+
+app.get("/adminlogin", (req, res) => {
+    req.session.admin == "0";
+    res.render("admin/adminlogin.ejs");
+});
+
+app.post("/adminauth", (req, res) => {
+    if (
+        req.body.email == process.env.ADMINEMAIL &&
+        req.body.password == process.env.ADMINPASSWORD
+    ) {
+        req.session.admin = "1";
+        res.render("admin/adminoption.ejs");
+    } else {
+        res.redirect("/adminlogin");
+    }
+});
+
+app.post("/addevent", upload.single('image'), async (req, res) => {
+    if (req.session.admin == "1") {
+
+        var found = await events.findOne({ name: req.body.name });
+
+        if (!found) {
+            const event = new events(req.body);
+            await event.save((err) => {
+                if (err) {
+                    res.send("DATA not saved" + err);
+                } else {
+                    res.render("admin/adminoption.ejs");
+                }
+            });
+        } else {
+
+            var eventUpdated = await events.updateOne({ name: req.body.name }, req.body);
+            if (!eventUpdated) {
+                res.send("DATA not updated");
+            } else {
+                res.render("admin/adminoption.ejs");
+            }
+        }
+
+
+    }
+});
+                                            
 
 // onetime coupon generate logic
 // app.get("/xyzabc",async (req,res)=>{
